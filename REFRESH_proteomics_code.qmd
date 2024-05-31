@@ -1,0 +1,1632 @@
+---
+title: "REFRESH code"
+author: "Díaz García, Claudio"
+---
+
+# Load libraries
+
+```{r}
+#| message = FALSE
+library(broom.mixed)
+library(ComplexHeatmap)
+library(igraph)
+library(ggraph)
+library(lme4)
+library(lmerTest)
+library(mgcv)
+library(openxlsx)
+library(parallel)
+library(purrr)
+library(readxl)
+library(tidyverse)
+```
+
+# Read raw data
+
+```{r}
+#| message = FALSE
+# Olink proteomics data
+protdata <- read_delim("data/Q-02656_Serrano_NPX_2022-08-29.csv",
+                       delim = ";")
+# Shotgun metagenomics abundance data with Kraken/Bracken
+# abundata <- read_tsv("data/kraken_gather_grouped_MICRO")
+# Shotgun metagenomics abundance data with mOTUs
+abundata_motus_tt <- read_tsv("data/phyloseq_profile_all_motus_profile_counts_g1l70_TT.tsv")
+abundata_motus_sub <- read_tsv("data/phyloseq_profile_all_motus_profile_count_g1l70_subsampling.tsv")
+# Shotgun metagenomics functional annotation data (from Alba)
+funcannotdata <- read_tsv("data/full_table_emapper.annotations_wo_euk.txt")
+# Shotgun metagenomics functional annotation data (nf, og, ko)
+nffuncdata <- read_tsv("data/nf_relabundance.tsv")
+ogfuncdata <- read_tsv("data/og_relabundance.tsv")
+kofuncdata <- read_tsv("data/ko_relabundance.tsv")
+# Shotgun metagenomcis functional quantification data
+funcquantdata <- read_tsv("data/full_table_coverm_values.txt")
+# Clinical variables data
+metadata <- read_xlsx("data/Info patients REFRESH.xlsx", n_max = 30)
+```
+
+# Data preprocessing
+
+## Standardization of sample ids
+
+### Olink proteomics data
+
+```{r}
+# Write function to standardize patient IDs
+transform_ids <- function(id) {
+  if (grepl("^R\\d{1,2} w\\d{1,2}$", id)) {
+    # Split the SampleID at whitespace
+    name_parts <- unlist(strsplit(id, " "))
+    # Remove letters and keep only participant and week numbers, and pad them with zeros if necessary
+    number_parts <- sprintf("%02d", as.numeric(gsub("[Rw]", "", name_parts)))
+    # Create the new name in the desired format
+    new_name <- paste0("R_P", number_parts[1], "_W", number_parts[2])
+    return(new_name)
+    } else {
+      return(id)
+    }
+}
+# Use function to obtain a data frame with the previous and standard ids
+olink_names <- data.frame(sampleid = sapply(unique(protdata$SampleID), transform_ids),
+                          olink_id = unique(protdata$SampleID), row.names = NULL)
+sample_names <- olink_names
+```
+
+### Shotgun metagenomics abundance data with Kraken/Bracken
+
+```{r}
+# Adapt previous function to standardize shotgun patient IDs
+transform_ids_shotgun <- function(id) {
+  # Cambiar el patrón para coincidir con el formato "RXXWXX" donde X representa dígitos
+  if (grepl("^R\\d{1,2}W\\d{1,2}$", id)) {
+    # Extraer los números de participante y semana con subsetting y regex
+    parts <- str_match(id, "^R(\\d{1,2})W(\\d{1,2})$")
+    # Pad the numbers with leading zeros if necessary
+    participant_number <- sprintf("%02d", as.numeric(parts[2]))
+    week_number <- sprintf("%02d", as.numeric(parts[3]))
+    # Crear el nuevo nombre en el formato deseado
+    new_name <- paste0("R_P", participant_number, "_W", week_number)
+    return(new_name)
+  } else {
+    return(id)
+  }
+}
+# Add previous ids to sample_names
+# kraken_names <- data.frame(sampleid = sapply(unique(abundata$sample), transform_ids_shotgun),
+#                            kraken_id = unique(abundata$sample))
+# sample_names <- sample_names |> full_join(kraken_names, by = "sampleid")
+```
+
+### Shotgun metagenomics abundance data with mOTUs
+
+```{r}
+# Reformat data
+abundata_motus_tt_long <- abundata_motus_tt |>
+  pivot_longer(cols = `0505_0101`:R9W7, names_to = "sample", values_to = "value") |>
+  select(Species, Genus, sample, value)
+motus_names <- data.frame(sampleid = sapply(unique(abundata_motus_tt_long$sample), transform_ids_shotgun),
+                          motus_id = unique(abundata_motus_tt_long$sample))
+# abundata_motus_sub_long <- abundata_motus_sub |>
+#   pivot_longer(cols = `0505_0101`:R9W7, names_to = "sample", values_to = "value") |>
+#   select(Species, sample, value)
+# Add previous ids to sample_names
+# motus_names <- data.frame(sampleid = sapply(unique(abundata_motus_sub_long$sample), transform_ids_shotgun),
+#                           motus_id = unique(abundata_motus_sub_long$sample))
+sample_names <- sample_names |> full_join(motus_names, by = "sampleid")
+```
+
+# Shotgun metagenomics functional annotation data (nf, og, ko)
+
+```{r}
+# Reformat data
+nffuncdata_long <- nffuncdata |>
+  select(-c("0505-0101", "543-46G1", "585-57G1", "R2W24X", "R2W24Y")) |> 
+  pivot_longer(cols = !Novel_Fam, names_to = "sample", values_to = "value")
+ogfuncdata_long <- ogfuncdata |>
+  select(-c("0505-0101", "543-46G1", "585-57G1", "R2W24X", "R2W24Y", Kingdom, Description)) |> 
+  pivot_longer(cols = !OG, names_to = "sample", values_to = "value")
+kofuncdata_long <- kofuncdata |>
+  select(-c("0505-0101", "543-46G1", "585-57G1", "R2W24X", "R2W24Y", Description, Symbol)) |> 
+  pivot_longer(cols = !KEGG_ko, names_to = "sample", values_to = "value")
+# Add previous ids to sample_names
+eggnog_names <- data.frame(sampleid = sapply(unique(nffuncdata_long$sample), transform_ids_shotgun),
+                           eggnog_id = unique(nffuncdata_long$sample))
+sample_names <- sample_names |> full_join(eggnog_names, by = "sampleid")
+```
+
+
+### Shotgun metagenomics functional annotation data
+
+```{r}
+# eggnog_names <- data.frame(sampleid = sapply(unique(funcannotdata$sample1), transform_ids_shotgun),
+#                            eggnog_id = unique(funcannotdata$sample1))
+# sample_names <- sample_names |> full_join(eggnog_names, by = "sampleid")
+```
+
+### Shotgun metagenomcis functional quantification data
+
+```{r}
+coverm_names <- data.frame(sampleid = sapply(unique(funcquantdata$sample2), transform_ids_shotgun),
+                           coverm_id = unique(funcquantdata$sample2))
+sample_names <- sample_names |> full_join(coverm_names, by = "sampleid")
+```
+
+### Information about patients and timepoints
+
+```{r}
+# Create patientid and week columns in sample_names
+sample_names$patientid <- ifelse(grepl("^R_P\\d{2}_W\\d{2}$", sample_names$sampleid),
+                                sapply(strsplit(sample_names$sampleid, "_"),
+                                       function(x) if (length(x) >= 2) x[[2]] else NA),
+                                NA)
+sample_names$week <- as.numeric(gsub("W", "", sapply(strsplit(sample_names$sampleid, "_"),
+                                                     function(x) if (length(x) >= 3) x[[3]] else NA)))
+# Create an additional week_cat variable with unique values 0, 1, 8, and 24
+sample_names$week_cat <- case_when(!is.na(sample_names$olink_id) & sample_names$week == 4 ~ 8,
+                                   !is.na(sample_names$olink_id) & sample_names$week %in% c(12, 48) ~ 24,
+                                   is.na(sample_names$olink_id) & sample_names$week == 5 ~ 4,
+                                   is.na(sample_names$olink_id) & sample_names$week == 6 ~ 7,
+                                   TRUE ~ sample_names$week)
+```
+
+### Clinical data
+
+```{r}
+# Standardize patient IDs in metadata
+metadata$patientid <- paste0("P", sprintf("%02d", as.numeric(gsub("R", "", metadata$id))))
+metadata <- metadata |> select(patientid, Group, everything()) |> rename(group = Group)
+# Add previous id and group information to sample_names
+sample_names <- sample_names |> left_join(metadata[, c("patientid", "group", "id")], by = "patientid") |> rename(metadata_id = id)
+# Change week_cat to account for the Placebo samples that were taken at week 7 but will be compared to samples from week 8
+sample_names$week_cat <- ifelse(sample_names$group == "Placebo" & sample_names$week == 7,
+                                8, sample_names$week_cat)
+```
+
+### Add sample names to each of the datasets
+
+```{r}
+# Olink proteomics data
+protdata <- protdata |>
+  left_join(sample_names, by = c("SampleID" = "olink_id")) |>
+  select(sampleid, patientid, week, week_cat, group, everything())
+# Shotgun metagenomics abundance data
+# abundata <- abundata |> 
+#   left_join(sample_names, by = c("sample" = "kraken_id")) |>
+#   select(sampleid, patientid, week, week_cat, group, everything())
+# Shotgun metagenomics abundance data with mOTUs (normalized subsampling)
+# abundata_motus_sub_long <- abundata_motus_sub_long |> 
+#   left_join(sample_names, by = c("sample" = "motus_id")) |>
+#   select(sampleid, patientid, week, week_cat, group, everything())
+abundata_motus_tt_long <- abundata_motus_tt_long |> 
+  left_join(sample_names, by = c("sample" = "motus_id")) |>
+  select(sampleid, patientid, week, week_cat, group, everything())
+# Shotgun metagenomics functional annotation data (nf, og, ko)
+nffuncdata_long <- nffuncdata_long |> 
+  left_join(sample_names, by = c("sample" = "eggnog_id")) |>
+  select(sampleid, patientid, week, week_cat, group, everything())
+ogfuncdata_long <- ogfuncdata_long |> 
+  left_join(sample_names, by = c("sample" = "eggnog_id")) |>
+  select(sampleid, patientid, week, week_cat, group, everything())
+kofuncdata_long <- kofuncdata_long |> 
+  left_join(sample_names, by = c("sample" = "eggnog_id")) |>
+  select(sampleid, patientid, week, week_cat, group, everything())
+# Shotgun metagenomics functional annotation data
+funcannotdata <- funcannotdata |> 
+  left_join(sample_names, by = c("sample1" = "eggnog_id")) |>
+  select(sampleid, patientid, week, week_cat, group, everything())
+# Shotgun metagenomcis functional quantification data
+funcquantdata <- funcquantdata |> 
+  left_join(sample_names, by = c("sample2" = "coverm_id")) |>
+  select(sampleid, patientid, week, week_cat, group, everything())
+```
+
+## Quality control
+
+### Olink proteomics data
+
+## Samples quality control
+
+First, remove control samples:
+
+```{r}
+protdata <- protdata |> filter(!grepl("CONTROL_SAMPLE", sampleid))
+```
+
+In this data set, the column that tells us about the quality of the samples is `QC_Warning`. A WARNING status can be due to 1) not enough counts in that specific sample (\<500 counts) or 2) a high deviation from the median of either the Incubation or Amplification controls.
+
+```{r}
+# Count the number of samples with WARNING status
+protdata |> 
+    filter(QC_Warning == "WARN") |> 
+    group_by(SampleID) |>
+    count(SampleID) |> 
+    mutate(Percentage = round(n / length(unique(protdata$Assay)) * 100)) |>
+    arrange(desc(Percentage))
+```
+
+We have decided to completely remove sample "R18 w24" from further analysis, given that more that 50% of the assays failed. For the rest of the flagged samples, we will exclude individual data points, as "current recommendations are to exclude individual data points flagged with QC warnings" (from manufacturer's guidelines).
+
+```{r}
+# Remove sample "R18 w24" and individual data points with QC warnings
+# protdata_filter1 <- protdata |> 
+#     filter(!SampleID == "R18 w24", QC_Warning != "WARN")
+protdata_filter1 <- protdata |> 
+    filter(!SampleID == "R18 w24")
+```
+
+## Assays quality control
+
+Regarding assays, `MissingFreq` and `LOD` are values that are related and should be considered together:
+
+-   **Missing frequency**: the frequency of samples with NPX value below limit of detection (LOD). Missing frequency is calculated without taking into account sample controls.
+
+-   **Limit of detection (LOD)**: the minimum level of an individual protein that can be measured. LOD is defined as 3 times the standard deviation over background (i.e. mean of the negative controls plus 3 times the SD).
+
+A value of 25-50% of missingness is the value recommended by Olink in their literature. We are going to apply that threshold (Missingness \> 50%) in our data. However, we will compute separate missingess values for FMT and Placebo.
+
+```{r}
+#| message = FALSE
+missingness <- protdata |> 
+  mutate(Missing = ifelse(NPX < LOD, TRUE, FALSE)) |> 
+  group_by(Assay, group) |> 
+  summarise(Missing = round(mean(Missing), 4))
+missingness
+```
+
+```{r}
+assays_todel <- protdata |> 
+    mutate(Missing = ifelse(NPX < LOD, TRUE, FALSE)) |> 
+    group_by(Assay, group) |> 
+    summarise(Missing = round(mean(Missing), 4 ) > 0.50) |> 
+    group_by(Assay) |>
+    summarise(Missing_status = all(Missing)) |> 
+    filter(Missing_status == TRUE) |> 
+    pull(Assay)
+assays_todel
+```
+
+These assays were removed, as their missingness was \>50% in both FMT and Placebo groups.
+
+```{r}
+# Remove assays with >50% missingness in both groups
+protdata_filter2 <- protdata_filter1 |>
+    filter(!Assay %in% assays_todel)
+```
+
+Next, another column that gives information about the quality of the assay is `Assay_Warning`. A WARNING status in the `Assay_Warning` column is due to high deviation of the median of the Negative Controls.
+
+```{r}
+protdata_filter2 |> 
+    filter(Assay_Warning != "PASS") |> 
+    count(Assay) |> 
+    mutate(percentage = round(n / length(unique(protdata_filter2$SampleID)) * 100)) |> 
+    arrange(desc(percentage))
+```
+
+The varying number of warnings depending on the assay is due to the different number of samples that were included in each plate. For instance, protein ANGPT1 failed in both plates, F2R and PRDX5 failed in the plate with the highest number of samples, while CTSC failed in the plate with the lowest number of samples. Therefore, ANGPT1 will be removed from further analysis and we will set the other ones as missing.
+
+```{r}
+# Remove ANGPT1
+protdata_filter3 <- protdata_filter2 |>
+    filter(Assay != "ANGPT1", Assay_Warning != "WARN")
+```
+
+Final data set for downstream analysis:
+
+```{r}
+protdata <- protdata_filter3
+```
+
+### Summary
+
+**1** individual sample (**\<1%**) was removed due to warning status from Olink QC procedure (changed from 116 to 115 samples).
+
+**20** protein assays (**6%**) were removed due to high missingness. **1** additional protein assay (**\<1%**) was removed due to warning status from Olink QC procedure (changed from 368 to 347 assays).
+
+# Heatmap
+
+```{r}
+# Create matrix with protein expression values
+protdata_mat <- xtabs(NPX ~ SampleID + Assay, data = protdata)
+# Scale
+protdata_mat_scaled <- scale(protdata_mat)
+# Get a dataframe with the same order as the rows of protdata_mat
+protdata_heatmap <- protdata |>
+    select(sampleid, patientid, week_cat, group) |>
+    distinct() |>
+    arrange(sampleid)
+protdata_heatmap$week_cat <- factor(protdata_heatmap$week_cat, levels = c(0, 1, 8, 24))
+```
+
+```{r}
+# Load the required library
+library(ComplexHeatmap)
+library(circlize)
+# Plot library
+set.seed(7)
+ht <- Heatmap(t(protdata_mat_scaled), name = "NPX",
+        col = colorRamp2(c(min(protdata_mat_scaled),
+                           mean(protdata_mat_scaled),
+                           max(protdata_mat_scaled)),
+                         c("blue", "white", "red")),
+        top_annotation = HeatmapAnnotation(df = protdata_heatmap[, c("group", "week_cat")],
+                                           col = list(group = c("Placebo" = "seagreen",
+                                                                "FMT" = "purple4"),
+                                                      week_cat = c("0" = "#08519c",
+                                                               "1" = "#3182bd",
+                                                               "8" = "#b2e2e2",
+                                                               "24" = "#edf8fb")),
+                                           border = TRUE),
+        show_row_names = FALSE,
+        column_labels = protdata_heatmap$patientid,
+        # Clustering tuning is happening from here
+        #column_km = 4, row_km = 2,
+        column_split = data.frame(protdata_heatmap$group,
+                                  protdata_heatmap$week_cat),
+        cluster_column_slices = FALSE, row_km = 2,
+        column_km_repeats = 100, row_km_repeats = 100,
+        show_parent_dend_line = FALSE, border = TRUE,
+        row_gap = unit(0.1, "mm"), column_gap = unit(0.1, "mm"),
+        column_names_gp = gpar(fontsize = 10))
+svg("figs/Figure_1_heatmap_344_proteins.svg", width = 16, height = 8)
+draw(ht, merge_legend = TRUE)
+dev.off()
+```
+
+# Differentially expressed proteins
+
+```{r}
+library(ggrepel)
+library(OlinkAnalyze)
+protdata_week0 <- protdata |> filter(week_cat == 0)
+dep_week0 <- olink_ttest(protdata_week0, "group")
+dep_week0
+dep_week0 <- dep_week0 %>%
+    mutate(prot_exp = case_when(estimate >= 0 & p.value <= 0.1 ~ "Up",
+                                estimate <= 0 & p.value <= 0.1 ~ "Down",
+                                TRUE ~ "n.s."))
+```
+
+```{r}
+protdata_week1 <- protdata |> filter(week_cat == 1)
+dep_week1 <- olink_ttest(protdata_week1, "group")
+dep_week1
+dep_week1 <- dep_week1 %>%
+    mutate(prot_exp = case_when(estimate >= 0 & p.value <= 0.1 ~ "Up",
+                                estimate <= 0 & p.value <= 0.1 ~ "Down",
+                                TRUE ~ "n.s."))
+```
+
+```{r}
+protdata_week8 <- protdata |> filter(week == 8)
+dep_week8 <- olink_ttest(protdata_week8, "group")
+dep_week8
+dep_week8 <- dep_week8 %>%
+    mutate(prot_exp = case_when(estimate >= 0 & p.value <= 0.1 ~ "Up",
+                                estimate <= 0 & p.value <= 0.1 ~ "Down",
+                                TRUE ~ "n.s."))
+```
+
+```{r}
+protdata_week24 <- protdata |> filter(week_cat == 24)
+dep_week24 <- olink_ttest(protdata_week24, "group")
+dep_week24
+dep_week24 <- dep_week24 %>%
+    mutate(prot_exp = case_when(estimate >= 0 & p.value <= 0.1 ~ "Up",
+                                estimate <= 0 & p.value <= 0.1 ~ "Down",
+                                TRUE ~ "n.s."))
+```
+
+## Volcano plot with 4 timepoints together
+
+```{r}
+# Modify results and add them together for plotting
+dep_week0$Week <- "Week 0"
+dep_week1$Week <- "Week 1"
+dep_week8$Week <- "Week 8"
+dep_week24$Week <- "Week 24"
+dep_weeks <- rbind(dep_week0, dep_week1, dep_week8, dep_week24)
+dep_weeks$Expression <- ifelse(dep_weeks$estimate > 0, "Up", "Down")
+# Order the levels of Week for plotting
+dep_weeks$Week <- factor(dep_weeks$Week,
+                         levels = c("Week 0", "Week 1", "Week 8", "Week 24"))
+# Count the number of assays that have positive and negative estimate for each week
+N_prots <- dep_weeks |>
+  group_by(Week, Expression) |>
+  summarise(n = n()) |> 
+  mutate(label = paste0("N = ", n))
+N_text_up <- N_prots |> filter(Expression == "Up")
+N_text_down <- N_prots |> filter(Expression == "Down")
+# Plot
+svg("figs/Figure_2_volcanoplot_DEIPs.svg", width = 8, height = 4)
+dep_weeks |> ggplot(aes(x = estimate, y = -log10(p.value))) +
+  geom_point(size = 0.5) +
+  labs(x = "NPX difference", y = "-log10(p-value)") + 
+  geom_hline(yintercept = -log10(0.05), linetype = "dashed") +
+  geom_vline(xintercept = 0, linetype = "dashed") +
+  theme_bw() +
+  facet_grid(cols = vars(Week)) +
+  geom_text(data = N_text_up,
+            mapping = aes(x = 1.5, y = 2.5, label = label)) +
+  geom_text(data = N_text_down,
+            mapping = aes(x = -1, y = 2.5, label = label))
+dev.off()
+```
+
+## GAM models
+
+```{r}
+# Define the Model Fitting Function:
+fit_gam_model <- function(data) {
+  tryCatch({
+    gam(NPX ~ group + s(week_cat, k = 4) + s(week_cat, k = 4, by = group) + s(patientid, bs = "re"),
+        data = data, method = "REML", na.action = na.exclude)
+  }, error = function(e) {
+    message("Error fitting model: ", e$message)
+    return(NULL)  # Return NULL on error
+  })
+}
+```
+
+```{r}
+# Split the data and apply the model fitting function
+protdata$patientid <- as.factor(protdata$patientid)
+protdata$group <- factor(protdata$group, levels = c("Placebo", "FMT"))
+gam_prots_full <- protdata %>%
+  split(.$Assay) %>%
+  map(fit_gam_model)
+```
+
+Output full models:
+
+```{r}
+GAMs_table <- lapply(gam_prots_full, function(x) {
+  p_table_mod <- summary(x)$p.table
+  p_table <- as.vector(p_table_mod)
+  names(p_table) <- paste(rownames(p_table_mod),
+                          rep(colnames(p_table_mod), each = 2),
+                          sep = "_")
+  s_table_mod <- summary(x)$s.table
+  s_table <- as.vector(s_table_mod)
+  names(s_table) <- paste(rownames(s_table_mod),
+                          rep(colnames(s_table_mod), each = 4),
+                          sep = "_")
+return(c(p_table, s_table))
+})
+GAMs_table <- as.data.frame(do.call(rbind, GAMs_table))
+GAMs_table <- GAMs_table |>
+  mutate(Significant = ifelse(`s(week_cat):groupFMT_p-value` < 0.1, "Yes", "No"))
+# Output to file
+# write.xlsx(GAMs_table, "results/GAMs_table.xlsx", row.names = TRUE)
+```
+
+## Line plots similar
+
+```{r}
+relevant_prots <- read_xlsx("results/GAMs_table.xlsx") |> filter(Significant == "Yes") |> arrange(desc(`s(week_cat):groupFMT_p-value`)) |> pull(1)
+
+svg("figs/Figure_3A_lineplots.svg", width = 12, height = 8)
+par(mfrow = c(3, 4), mar = c(2, 2, 2, 1))
+lapply(relevant_prots[1:12], function(x) {
+  print(x)
+  visreg(
+    gam_prots_full[[x]],
+    data = gam_prots_full[[x]]$model,
+    xvar = "week_cat",
+    xlab = "", ylab = "",
+    by = "group",
+    method = "REML",
+    overlay = TRUE,
+    main = x,
+    band = FALSE,
+    legend = FALSE,
+    line=list(col = c("seagreen", "purple4")),
+    points=list(col = c("seagreen", "purple4"))
+  )
+  abline(h = 0, col = "black", lwd = 1, lty = 2)
+})
+dev.off()
+
+svg("figs/Figure_3B_lineplots.svg", width = 12, height = 8)
+par(mfrow = c(3, 4), mar = c(2, 2, 2, 1))
+lapply(relevant_prots[13:24], function(x) {
+  print(x)
+  visreg(
+    gam_prots_full[[x]],
+    data = gam_prots_full[[x]]$model,
+    xvar = "week_cat",
+    xlab = "", ylab = "",
+    by = "group",
+    method = "REML",
+    overlay = TRUE,
+    main = x,
+    band = FALSE,
+    legend = FALSE,
+    line=list(col = c("seagreen", "purple4")),
+    points=list(col = c("seagreen", "purple4"))
+  )
+  abline(h = 0, col = "black", lwd = 1, lty = 2)
+})
+dev.off()
+
+svg("figs/Figure_3C_lineplots.svg", width = 12, height = 8)
+par(mfrow = c(3, 4), mar = c(2, 2, 2, 1))
+lapply(relevant_prots[25:36], function(x) {
+  print(x)
+  visreg(
+    gam_prots_full[[x]],
+    data = gam_prots_full[[x]]$model,
+    xvar = "week_cat",
+    xlab = "", ylab = "",
+    by = "group",
+    method = "REML",
+    overlay = TRUE,
+    main = x,
+    band = FALSE,
+    legend = FALSE,
+    line=list(col = c("seagreen", "purple4")),
+    points=list(col = c("seagreen", "purple4"))
+  )
+  abline(h = 0, col = "black", lwd = 1, lty = 2)
+})
+dev.off()
+
+svg("figs/Figure_3D_lineplots.svg", width = 12, height = 8)
+par(mfrow = c(3, 4), mar = c(2, 2, 2, 1))
+lapply(relevant_prots[37:46], function(x) {
+  print(x)
+  visreg(
+    gam_prots_full[[x]],
+    data = gam_prots_full[[x]]$model,
+    xvar = "week_cat",
+    xlab = "", ylab = "",
+    by = "group",
+    method = "REML",
+    overlay = TRUE,
+    main = x,
+    band = FALSE,
+    legend = FALSE,
+    line=list(col = c("seagreen", "purple4")),
+    points=list(col = c("seagreen", "purple4"))
+  )
+  abline(h = 0, col = "black", lwd = 1, lty = 2)
+})
+dev.off()
+```
+
+# Correlation between proteins and abundance of bacteria (mOTUs)
+
+## Join data
+
+```{r}
+# Proteins data
+dep_names <- GAMs_table |> filter(Significant == "Yes") |> rownames()
+protdata <- protdata |> filter(Assay %in% dep_names) |> select(patientid, week_cat, group, Assay, NPX)
+# Bacterial abundances data
+abundata_motus <- abundata_motus_tt_long |> filter(!sampleid %in% c("0505_0101", "543_46G1", "585_57G1"))
+abundata_motus <- abundata_motus |> select(patientid, week_cat, group, Genus, Species, value)
+# Keep values for weeks 0, 1, 8 and 24 only
+abundata_motus <- abundata_motus |> filter(week_cat %in% c(0, 1, 8, 24))
+## Remove sample R_P18_W24 (not present in proteomics dataset)
+abundata_motus <- abundata_motus |> filter(!(patientid == "P18" & week_cat == 24))
+# Normalise by total reads per sample
+abundata_motus_rel <- abundata_motus |>
+  group_by(patientid, week_cat) |>
+  mutate(relvalue = value / sum(value))
+# Join protein and bacteria data
+prot_abun_data <- left_join(abundata_motus_rel, protdata, by = c("patientid", "week_cat", "group"),
+relationship = "many-to-many") |> select(patientid, week_cat, group, Species, value, relvalue, Assay, NPX)
+names(prot_abun_data) <- c("patientid", "week", "group",
+                               "bacteria", "abundance", "relabundance", "protein", "NPX")
+```
+
+## Linear mixed models loop (PARALLEL version)
+
+```{r}
+# PARALLEL VERSION
+# Define the function to fit the model and extract results
+fit_lmer <- function(x) {
+  tryCatch({
+    lmm <- lmer(NPX ~ abundance + group + week + (1 | patientid), data = x)
+    results <- summary(lmm)$coeff["abundance", c("Estimate", "Pr(>|t|)")]
+    return(results)
+  }, error = function(e) {
+    cat("Error in processing group:", unique(x$protein), "-", unique(x$bacteria), "\n")
+    return(data.frame(Estimate = NA, `Pr(>|t|)` = NA))
+  })
+}
+
+# Set up parallel cluster
+num_cores <- detectCores() - 2  # Use one less than the total number of cores
+cl <- makeCluster(num_cores)
+
+# Export necessary variables and packages to the cluster
+clusterExport(cl, varlist = c("fit_lmer", "prot_abun_data", "lmer", "summary", "cat"))
+clusterEvalQ(cl, library(lme4))
+
+# Split the data by unique combinations of protein and function_name
+split_data <- split(prot_abun_data, list(prot_abun_data$protein, prot_abun_data$bacteria), drop = TRUE)
+
+# Apply the function in parallel
+parallel_results <- parLapply(cl, split_data, fit_lmer)
+
+# Stop the cluster
+stopCluster(cl)
+
+# Combine the results
+lmer_results <- do.call(rbind, parallel_results)
+
+# Create the final data frame with the results
+lmer_results_df <- lmer_results  |>
+    rename(Estimate = Estimate, pvalue = Pr...t..) |> 
+    rownames_to_column(var = "Combined") |> 
+    separate_wider_delim(Combined, names = c("Protein", "Bacteria"), delim = ".", too_many = "merge")
+
+# Adjust p-values and add significance levels
+lmer_results_df$pvalue_adj <- p.adjust(lmer_results_df$pvalue, method = "fdr")
+lmer_results_df$Significance <- ifelse(lmer_results_df$pvalue_adj < 0.001, "***",
+                                       ifelse(lmer_results_df$pvalue_adj < 0.01, "**",
+                                              ifelse(lmer_results_df$pvalue_adj < 0.1, "*", "")))
+protbact_results <- lmer_results_df |> filter(pvalue_adj < 0.05) |> arrange(pvalue)
+# Output to file .xlsx
+# write.xlsx(protbact_results, "results/protbactmotus_rel_results_significant.xlsx", row.names = FALSE)
+```
+
+### Count the number of significant proteins per bacteria and the number of significant bacteria per protein
+
+```{r}
+protbact_results <- read_xlsx("results/protbactmotus_rel_results_significant.xlsx")
+# Count the number of significant proteins per bacteria
+bacteria_counts <- protbact_results |> 
+  group_by(Protein) |> 
+  summarize(
+    `Number of bacteria` = n_distinct(Bacteria),
+    `Species of bacteria` = paste(unique(Bacteria), collapse = ", ")
+  ) |> 
+  arrange(desc(`Number of bacteria`))
+bacteria_counts$`Species of bacteria` <- gsub("S_", "", bacteria_counts$`Species of bacteria`)
+# Output to file .xlsx
+# write.xlsx(bacteria_counts, "results/protbactmotus_rel_counts_bacteria.xlsx", row.names = FALSE)
+# # Count the number of significant bacteria per protein
+protein_counts <- protbact_results |> 
+  group_by(Bacteria) |> 
+  summarize(
+    `Number of proteins` = n_distinct(Protein),
+    `Proteins` = paste(unique(Protein), collapse = ", ")
+  ) |> 
+  arrange(desc(`Number of proteins`))
+protein_counts$`Bacteria` <- gsub("S_", "", protein_counts$`Bacteria`)
+# Output to file .xlsx
+# write.xlsx(protein_counts, "results/protbactmotus_rel_counts_protein.xlsx", row.names = FALSE)
+```
+
+# Prevalence of bacterias
+
+```{r}
+# Compute the mean relabundance and the count of patients with abundance > 0
+abundata_full_stats <- prot_abun_data |> 
+    select(patientid, week, group, bacteria, abundance, relabundance) |>
+    distinct() |> 
+    group_by(bacteria, group, week) %>%
+    summarize(
+        mean_relabundance = mean(relabundance, na.rm = TRUE),
+        num_patients_above_zero = sum(abundance > 0),
+        .groups = 'drop'
+    )
+# Keep only information about bacteria with significant correlations with the differentially expressed proteins
+abundata_full_stats <- abundata_full_stats |> 
+    filter(bacteria %in% protein_counts$Bacteria)
+# Reformat the data to have one column per group and week
+abundata_full_stats <- abundata_full_stats |> 
+    pivot_wider(names_from = c(group, week), values_from = c(mean_relabundance, num_patients_above_zero))
+# Export to file
+# write.xlsx(abundata_full_stats, "results/prevalence_motus_full_stats.xlsx", row.names = FALSE)
+```
+
+## Heatmap about prevalence and abundance of bacteria
+
+```{r}
+# Obtain abundance and prevalence of the relevant bacteria (correlated with > 2 DEIPs)
+abundata_full_stats <- read.xlsx("results/prevalence_motus_full_stats.xlsx",
+                                 startRow = 4, colNames = FALSE)
+colnames(abundata_full_stats) <- c("Bacteria",
+                                   paste0("Abundance_", paste0("FMT_", c("00", "01", "08", "24"))),
+                                   paste0("Abundance_", paste0("Placebo_", c("00", "08", "24"))),
+                                   paste0("Prevalence_", paste0("FMT_", c("00", "01", "08", "24"))),
+                                   paste0("Prevalence_", paste0("Placebo_", c("00", "08", "24"))),
+                                   "Minimum_FMT", "Minimum_Placebo")
+protein_counts <- read.xlsx("results/protbactmotus_rel_counts_protein.xlsx")
+protein_counts <- protein_counts |>
+  filter(Number.of.proteins > 2)
+abundata_filtered <- abundata_full_stats |>
+    filter(Bacteria %in% protein_counts$Bacteria)
+abundata_filtered <- abundata_filtered[abundata_filtered$Bacteria %in% protein_counts$Bacteria, ]
+```
+
+```{r}
+# Filter the data to include only prevalence values
+prevalence_data <- abundata_filtered |> 
+  select(Bacteria, starts_with("Prevalence"))
+prevalence_matrix <- as.matrix(prevalence_data[, -1])
+rownames(prevalence_matrix) <- prevalence_data$Bacteria
+abundance_data <- abundata_filtered |> 
+  select(Bacteria, starts_with("Abundance"))
+abundance_matrix <- round(as.matrix(abundance_data[, -1]) * 100, 1)
+rownames(abundance_matrix) <- abundance_data$Bacteria
+
+# Heatmap annotation
+top_annotation <- HeatmapAnnotation(
+  Group = rep(c("FMT", "Placebo"), times = c(4, 3)),
+  col = list(Group = c("FMT" = "purple4", "Placebo" = "skyblue")),
+  annotation_height = unit(2, "mm")
+)
+
+# Make heatmap of abundances
+svg("figs/Figure_5A_abundance_of_relevant_bacteria.svg", width = 8, height = 16)
+Heatmap(abundance_matrix,
+        cluster_rows = FALSE, cluster_columns = FALSE,
+        col = colorRampPalette(c("white", "darkgreen"))(100),
+        cell_fun = function(j, i, x, y, width, height, fill) {
+    grid.text(abundance_matrix[i, j], x, y, gp = gpar(fontsize = 10))
+        },
+  top_annotation = top_annotation)
+dev.off()
+# Make heatmap of prevalences
+svg("figs/Figure_5A_prevalence_of_relevant_bacteria.svg", width = 8, height = 16)
+Heatmap(prevalence_matrix,
+        cluster_rows = FALSE, cluster_columns = FALSE,
+        col = colorRampPalette(c("white", "darkgreen"))(100),
+        cell_fun = function(j, i, x, y, width, height, fill) {
+    grid.text(prevalence_matrix[i, j], x, y, gp = gpar(fontsize = 10))
+        },
+  top_annotation = top_annotation)
+dev.off()
+# Make heatmap of abundances and prevalences
+# Heatmap(abundance_matrix,
+#         cluster_rows = FALSE, cluster_columns = FALSE,
+#         col = colorRampPalette(c("white", "darkgreen"))(100),
+#         cell_fun = function(j, i, x, y, width, height, fill) {
+#     grid.text(prevalence_matrix[i, j], x, y, gp = gpar(fontsize = 10))
+#   },
+#   top_annotation = top_annotation)
+```
+
+## Repeat at the genus level
+
+```{r}
+# Normalise by total reads per sample at the genus level
+abundata_motus_rel_genus <- abundata_motus |>
+  group_by(patientid, week_cat, group, Genus) |> 
+  summarise(value_genus = sum(value)) |> 
+  group_by(patientid, week_cat) |>
+  mutate(relvalue_genus = value_genus / sum(value_genus))
+# Compute the mean relabundance and the count of patients with abundance > 0
+abundata_full_stats_genus <- abundata_motus_rel_genus |>
+    group_by(Genus, group, week_cat) %>%
+    summarize(
+        mean_relabundance = mean(relvalue_genus, na.rm = TRUE),
+        num_patients_above_zero = sum(value_genus > 0),
+        .groups = 'drop'
+    )
+# Keep only Genus with Species that have at least 3 significant correlations with DEIPs
+protein_counts_relevant_species <- protein_counts |>
+    filter(`Number of proteins` > 2)
+# Get relevant Genus
+relevant_genus <- abundata_motus |> select(Genus, Species) |> distinct() |> filter(Species %in% protein_counts_relevant_species$Bacteria) |> pull(Genus) |> unique()
+# Keep only information about bacteria with significant correlations with the differentially expressed proteins
+abundata_full_stats_genus <- abundata_full_stats_genus |> 
+    filter(Genus %in% relevant_genus)
+# Reformat the data to have one column per group and week
+abundata_full_stats_genus <- abundata_full_stats_genus |> 
+    pivot_wider(names_from = c(group, week_cat), values_from = c(mean_relabundance, num_patients_above_zero))
+# Export to file
+# write.xlsx(abundata_full_stats_genus, "results/prevalence_motus_full_stats_genus.xlsx", row.names = FALSE)
+```
+
+## Heatmap about prevalence and abundance of bacteria
+
+```{r}
+# Obtain abundance and prevalence of the relevant genus (species correlated with > 2 DEIPs)
+abundata_full_stats_genus <- read.xlsx("results/prevalence_motus_full_stats_genus.xlsx",
+                                 startRow = 4, colNames = FALSE)
+colnames(abundata_full_stats_genus) <- c("Genus",
+                                   paste0("Abundance_", paste0("FMT_", c("00", "01", "08", "24"))),
+                                   paste0("Abundance_", paste0("Placebo_", c("00", "08", "24"))),
+                                   paste0("Prevalence_", paste0("FMT_", c("00", "01", "08", "24"))),
+                                   paste0("Prevalence_", paste0("Placebo_", c("00", "08", "24"))),
+                                   "Minimum_FMT", "Minimum_Placebo")
+```
+
+```{r}
+# Filter the data to include only prevalence values
+prevalence_data <- abundata_full_stats_genus |> 
+  select(Genus, starts_with("Prevalence"))
+prevalence_matrix <- as.matrix(prevalence_data[, -1])
+rownames(prevalence_matrix) <- prevalence_data$Genus
+abundance_data <- abundata_full_stats_genus |> 
+  select(Genus, starts_with("Abundance"))
+abundance_matrix <- round(as.matrix(abundance_data[, -1]) * 100, 1)
+rownames(abundance_matrix) <- abundance_data$Genus
+
+# Heatmap annotation
+top_annotation <- HeatmapAnnotation(
+  Group = rep(c("FMT", "Placebo"), times = c(4, 3)),
+  col = list(Group = c("FMT" = "purple4", "Placebo" = "skyblue")),
+  annotation_height = unit(2, "mm"),
+  Group = list(direction = "horizontal", nrow = 1)
+)
+
+# Make heatmap of abundances
+svg("figs/Figure_5B_abundance_of_relevant_genus.svg", width = 7, height = 5)
+draw(Heatmap(abundance_matrix,
+        cluster_rows = FALSE, cluster_columns = FALSE,
+        col = colorRampPalette(c("white", "darkgreen"))(100),
+        cell_fun = function(j, i, x, y, width, height, fill) {
+    grid.text(abundance_matrix[i, j], x, y, gp = gpar(fontsize = 10))
+        },
+  top_annotation = top_annotation,
+  heatmap_legend_param = list(title = "Abundance", direction = "horizontal")))
+dev.off()
+# Make heatmap of prevalences
+svg("figs/Figure_5B_prevalence_of_relevant_genus.svg", width = 7, height = 5)
+draw(Heatmap(prevalence_matrix,
+        cluster_rows = FALSE, cluster_columns = FALSE,
+        col = colorRampPalette(c("white", "darkgreen"))(100),
+        cell_fun = function(j, i, x, y, width, height, fill) {
+    grid.text(prevalence_matrix[i, j], x, y, gp = gpar(fontsize = 10))
+        },
+  top_annotation = top_annotation,
+  heatmap_legend_param = list(title = "Abundance", direction = "horizontal")))
+dev.off()
+```
+
+# Networks of interactions bacteria-plasma protein
+
+```{r}
+# Unfiltered network
+# Read correlation results data
+protbact_results <- read.xlsx("results/protbactmotus_rel_results_significant.xlsx")
+protbact_results <- protbact_results |> 
+    filter(Bacteria %in% protein_counts$Bacteria)
+# Changes in name formatting for better display in network plot
+protbact_results$`Bacteria` <- gsub("s__", "", protbact_results$`Bacteria`)
+protbact_results$Bacteria <- gsub(" \\[.*\\]", "", protbact_results$Bacteria)
+protbact_results$Bacteria <- sub(" ", "\n", protbact_results$Bacteria)
+# Format data for network plot
+network_data <- protbact_results |>
+    mutate(from = Bacteria, to = Protein, weight = abs(Estimate)) |> 
+    select(from, to, weight)
+network_plot <- graph_from_data_frame(network_data, directed = FALSE)
+# First plot
+ggraph(network_plot, layout = "fr") +
+    geom_edge_link(aes(edge_alpha = weight), show.legend = FALSE) +
+    geom_node_point(color = "lightblue", size = 5) +
+    geom_node_text(aes(label = name), repel = TRUE) +
+    theme_void()
+# Assign shapes based on whether the node is a bacteria or a protein
+V(network_plot)$shape <- ifelse(V(network_plot)$name %in% protbact_results$Bacteria, "bacteria", "protein")
+# Calculate the degree (number of connections) for each node
+V(network_plot)$degree <- degree(network_plot, mode = "all")
+# Normalize node sizes for better visualization (optional)
+V(network_plot)$size <- V(network_plot)$degree / max(V(network_plot)$degree) * 10 + 3  # Scaling factor
+# Plot network
+svg("figs/Figure_5C_network_bacteria&DEIPs_unfiltered.svg", width = 10, height = 10)
+ggraph(network_plot, layout = "fr") +
+    geom_edge_link(aes(edge_alpha = weight)) +
+    geom_node_point(aes(shape = shape, size = size), fill = "lightblue") +
+    geom_node_text(aes(label = name), repel = TRUE) +
+    scale_shape_manual(values = c("bacteria" = 21, "protein" = 22)) +
+    theme_void()
+dev.off()
+```
+
+```{r}
+# Filtered network
+# Read correlation results data
+protbact_results <- read.xlsx("results/protbactmotus_rel_results_significant.xlsx")
+# At least 5 correlations
+protein_counts_relevant_species_network <- protein_counts |>
+    filter(`Number of proteins` > 4)
+protbact_results <- protbact_results |> 
+    filter(Bacteria %in% protein_counts_relevant_species_network$Bacteria)
+# Changes in name formatting for better display in network plot
+protbact_results$`Bacteria` <- gsub("s__", "", protbact_results$`Bacteria`)
+protbact_results$Bacteria <- gsub(" \\[.*\\]", "", protbact_results$Bacteria)
+protbact_results$Bacteria <- sub(" ", "\n", protbact_results$Bacteria)
+# Format data for network plot
+network_data <- protbact_results |>
+    mutate(from = Bacteria, to = Protein, weight = abs(Estimate)) |> 
+    select(from, to, weight)
+network_plot <- graph_from_data_frame(network_data, directed = FALSE)
+# First plot
+ggraph(network_plot, layout = "fr") +
+    geom_edge_link(aes(edge_alpha = weight), show.legend = FALSE) +
+    geom_node_point(color = "lightblue", size = 5) +
+    geom_node_text(aes(label = name), repel = TRUE) +
+    theme_void()
+# Assign shapes based on whether the node is a bacteria or a protein
+V(network_plot)$shape <- ifelse(V(network_plot)$name %in% protbact_results$Bacteria, "bacteria", "protein")
+# Calculate the degree (number of connections) for each node
+V(network_plot)$degree <- degree(network_plot, mode = "all")
+# Normalize node sizes for better visualization (optional)
+V(network_plot)$size <- V(network_plot)$degree / max(V(network_plot)$degree) * 10 + 3  # Scaling factor
+# Plot network
+svg("figs/Figure_5C_network_bacteria&DEIPs_filtered.svg", width = 10, height = 10)
+ggraph(network_plot, layout = "fr") +
+    geom_edge_link(aes(edge_alpha = weight)) +
+    geom_node_point(aes(shape = shape, size = size), fill = "lightblue") +
+    geom_node_text(aes(label = name), repel = TRUE) +
+    scale_shape_manual(values = c("bacteria" = 21, "protein" = 22)) +
+    theme_void()
+dev.off()
+```
+
+# Correlation between proteins and functional annotations of bacteria
+
+```{r}
+# Bacterial functions data
+funcquantdata <- funcquantdata |> 
+  filter(!sampleid %in% c("505_0101", "543_46G1", "485_57G1",
+## For now, remove samples R2W24X and R2W24Y (I don't know what happened here)
+                         "R2W24X", "R2W24Y")) 
+## Keep values for weeks 0, 1, 8 and 24 only
+funcquantdata <- funcquantdata |> filter(week_cat %in% c(0, 1, 8, 24))
+## Keep only columns of interest
+funcquantdata <- funcquantdata |> select(sampleid, patientid, week, week_cat, group, contigName2, RPK)
+# Bacterial functions annotation data
+funcannotdata$contigName2 <- gsub("_[0-9]+$", "", funcannotdata$contigName1)
+funcannotdata <- funcannotdata |> 
+  filter(!sampleid %in% c("505_0101", "543_46G1", "485_57G1",
+## For now, remove samples R2W24X and R2W24Y (I don't know what happened here)
+                         "R2W24X", "R2W24Y"))
+## Keep values for weeks 0, 1, 8 and 24 only
+funcannotdata <- funcannotdata |> filter(week_cat %in% c(0, 1, 8, 24))
+# Join annotation and quantification data for bacterial functions
+funcdata_full <- left_join(funcannotdata, funcquantdata,
+    by = c("contigName2", "sampleid", "patientid", "week", "week_cat", "group"),
+    relationship = "many-to-one")
+funcdata_matrix <- funcdata_full |> select(Preferred_name, sampleid, RPK, patientid, week_cat) |> filter(Preferred_name != "-")
+funcdata_matrix_sum <- funcdata_matrix |>
+  group_by(Preferred_name, sampleid, patientid, week_cat) |>
+  summarise(RPK = sum(RPK), .groups = "drop")
+colnames(funcdata_matrix_sum) <- c("function_name", "sampleid", "patientid", "week_cat", "RPK")
+```
+
+```{r}
+# Join protein and functions data
+# Rebuild sampleid in protdata with week_cat
+protdata$sampleid_cat <- paste0("R_", protdata$patientid, "_W", sprintf("%02d", protdata$week_cat))
+# Rebuild sampleid in funcdata_matrix_sum with week_cat
+funcdata_matrix_sum$sampleid_cat <- paste0("R_", funcdata_matrix_sum$patientid, "_W", sprintf("%02d", funcdata_matrix_sum$week_cat))
+## Check if there are samplids that are not in both dataframes
+funcdata_matrix_sum_2del <- setdiff(unique(funcdata_matrix_sum$sampleid_cat), unique(protdata$sampleid_cat))
+funcdata_matrix_sum <- funcdata_matrix_sum |> filter(!sampleid %in% funcdata_matrix_sum_2del)
+funcdata_matrix_sum_2del <- setdiff(unique(funcdata_matrix_sum$sampleid_cat), unique(protdata$sampleid_cat)) # character(0)
+prot_fun_data <- left_join(funcdata_matrix_sum, protdata, by = c("sampleid_cat", "patientid", "week_cat"),
+                           relationship = "many-to-many")
+colnames(prot_fun_data)[8:9] <- c("protein", "NPX")
+# Count functions per group:
+prevalent_functions <- prot_fun_data  |> 
+  select(function_name, patientid, group) |> 
+  distinct() |> 
+  group_by(function_name) |> 
+  summarise(FMT_count = sum(group == "FMT"),
+            Placebo_count = sum(group == "Placebo")) |>
+  filter(FMT_count > 6 | Placebo_count > 6) |> 
+  pull(function_name)
+
+prot_fun_data <- prot_fun_data |> filter(function_name %in% prevalent_functions)
+```
+
+```{r}
+# PARALLEL VERSION
+# Define the function to fit the model and extract results
+fit_lmer <- function(x) {
+  tryCatch({
+    lmm <- lmer(NPX ~ RPK + group + week_cat + (1 | patientid), data = x)
+    results <- summary(lmm)$coeff["RPK", c("Estimate", "Pr(>|t|)")]
+    return(results)
+  }, error = function(e) {
+    cat("Error in processing group:", unique(x$protein), "-", unique(x$function_name), "\n")
+    return(data.frame(Estimate = NA, `Pr(>|t|)` = NA))
+  })
+}
+
+# Set up parallel cluster
+num_cores <- detectCores() - 2  # Use one less than the total number of cores
+cl <- makeCluster(num_cores)
+
+# Export necessary variables and packages to the cluster
+clusterExport(cl, varlist = c("fit_lmer", "prot_fun_data", "lmer", "summary", "cat"))
+clusterEvalQ(cl, library(lme4))
+
+# Split the data by unique combinations of protein and function_name
+split_data <- split(prot_fun_data, list(prot_fun_data$protein, prot_fun_data$function_name), drop = TRUE)
+
+# Apply the function in parallel
+parallel_results <- parLapply(cl, split_data, fit_lmer)
+
+# Stop the cluster
+stopCluster(cl)
+
+# Combine the results
+lmer_results <- do.call(rbind, parallel_results)
+
+# Create the final data frame with the results
+lmer_results_df <- lmer_results  |>
+    rename(Estimate = Estimate, pvalue = Pr...t..) |> 
+    rownames_to_column(var = "Combined") |> 
+    separate(Combined, into = c("Protein", "Function_name"), sep = "\\.")
+
+# Adjust p-values and add significance levels
+lmer_results_df$pvalue_adj <- p.adjust(lmer_results_df$pvalue, method = "fdr")
+lmer_results_df$Significance <- ifelse(lmer_results_df$pvalue_adj < 0.001, "***",
+                                       ifelse(lmer_results_df$pvalue_adj < 0.01, "**",
+                                              ifelse(lmer_results_df$pvalue_adj < 0.1, "*", "")))
+protfunc_results <- lmer_results_df |> filter(pvalue_adj < 0.05) |> arrange(pvalue)
+# Output to file .xlsx
+write.xlsx(protfunc_results, "results/protfunc_results_significant.xlsx", row.names = FALSE)
+```
+
+### Count the number of significant proteins per bacterial function (genes) and the number of significant bacterial functions (genes) per protein
+
+```{r}
+protfunc_results <- read_xlsx("results/protfunc_results_significant.xlsx")
+# Count the number of significant proteins per bacteria
+function_counts <- protfunc_results |> 
+  group_by(Protein) |> 
+  summarize(
+    `Number of bacterial functions (genes)` = n_distinct(Function_name),
+    `Bacterial functions (genes)` = paste(unique(Function_name), collapse = ", ")
+  ) |> 
+  arrange(desc(`Number of bacterial functions (genes)`))
+# Output to file .xlsx
+# write.xlsx(function_counts, "results/protfunc_counts_function.xlsx", row.names = FALSE)
+# # Count the number of significant bacteria per protein
+protein_counts <- protfunc_results |> 
+  group_by(Function_name) |> 
+  summarize(
+    `Number of proteins` = n_distinct(Protein),
+    `Proteins` = paste(unique(Protein), collapse = ", ")
+  ) |> 
+  arrange(desc(`Number of proteins`))
+# Output to file .xlsx
+# write.xlsx(protein_counts, "results/protfunc_counts_protein.xlsx", row.names = FALSE)
+```
+
+# Networks of interactions bacterial functions-plasma proteins
+
+```{r}
+# Read correlation results data
+# protfunc_results                              # Get from previous code chunk
+protein_counts_filtered <- protein_counts |> 
+  filter(`Number of proteins` > 4)
+protfunc_results <- protfunc_results |> 
+    filter(Function_name %in% protein_counts_filtered$Function_name)
+# Format data for network plot
+network_data <- protfunc_results |>
+    mutate(from = Function_name, to = Protein, weight = abs(Estimate)) |> 
+    select(from, to, weight)
+network_plot <- graph_from_data_frame(network_data, directed = FALSE)
+# First plot
+ggraph(network_plot, layout = "fr") +
+    geom_edge_link(aes(edge_alpha = weight), show.legend = FALSE) +
+    geom_node_point(color = "lightblue", size = 5) +
+    geom_node_text(aes(label = name), repel = TRUE) +
+    theme_void()
+# Assign shapes based on whether the node is a bacteria or a protein
+V(network_plot)$shape <- ifelse(V(network_plot)$name %in% protfunc_results$Function_name, "Function_name", "protein")
+# Calculate the degree (number of connections) for each node
+V(network_plot)$degree <- degree(network_plot, mode = "all")
+# Normalize node sizes for better visualization (optional)
+V(network_plot)$size <- V(network_plot)$degree / max(V(network_plot)$degree) * 10 + 3  # Scaling factor
+# Plot network
+svg("figs/Figure_6A_network_bacterialgenes&DEIPs_filtered.svg", width = 10, height = 10)
+set.seed(7)
+ggraph(network_plot, layout = "fr") +
+    geom_edge_link(aes(edge_alpha = weight)) +
+    geom_node_point(aes(shape = shape, size = size), fill = "lightblue") +
+    geom_node_text(aes(label = name), repel = TRUE) +
+    scale_shape_manual(values = c("Function_name" = 21, "protein" = 22)) +
+    theme_void()
+dev.off()
+```
+
+# Correlation between proteins and bacterial functions (ko, og, nf)
+
+## eggNOG orthologous groups (og)
+
+```{r}
+## Keep values for weeks 0, 1, 8 and 24 only
+ogfuncdata_long <- ogfuncdata_long |> filter(week_cat %in% c(0, 1, 8, 24))
+## Keep only columns of interest
+ogfuncdata_long <- ogfuncdata_long |> select(sampleid, patientid, week, week_cat, group, OG, value)
+# Join protein and functions data
+# Rebuild sampleid in protdata with week_cat
+protdata$sampleid_cat <- paste0("R_", protdata$patientid, "_W", sprintf("%02d", protdata$week_cat))
+# Filter by DEIPs
+# Proteins data
+dep_names <- GAMs_table |> filter(Significant == "Yes") |> rownames()
+protdata <- protdata |> filter(Assay %in% dep_names) |> select(patientid, week_cat, group, Assay, NPX, sampleid_cat)
+# Rebuild sampleid in ogfuncdata_long with week_cat
+ogfuncdata_long$sampleid_cat <- paste0("R_", ogfuncdata_long$patientid, "_W", sprintf("%02d", ogfuncdata_long$week_cat))
+## Check if there are samplids that are not in both dataframes
+ogfuncdata_long_2del <- setdiff(unique(ogfuncdata_long$sampleid_cat), unique(protdata$sampleid_cat))
+ogfuncdata_long <- ogfuncdata_long |> filter(!sampleid %in% ogfuncdata_long_2del)
+ogfuncdata_long_2del <- setdiff(unique(ogfuncdata_long$sampleid_cat), unique(protdata$sampleid_cat)) # character(0)
+# Simplify
+ogfuncdata_long <- ogfuncdata_long |> select(sampleid_cat, patientid, week_cat, group, OG, value)
+protdata <- protdata |> select(sampleid_cat, patientid, week_cat, group, Assay, NPX)
+# Join
+prot_ogfun_data <- left_join(ogfuncdata_long, protdata,
+                             by = c("sampleid_cat", "patientid", "week_cat", "group"),
+                             relationship = "many-to-many")
+colnames(prot_ogfun_data) <- c("sampleid", "patientid", "week", "group", "OG", "value", "protein", "NPX")
+# Count functions per group (filter by prevalence of functions):
+prevalent_functions <- prot_ogfun_data  |> 
+  select(OG, patientid, group) |> 
+  distinct() |> 
+  group_by(OG) |> 
+  summarise(FMT_count = sum(group == "FMT"),
+            Placebo_count = sum(group == "Placebo")) |>
+  filter(FMT_count > 6 | Placebo_count > 6) |> 
+  pull(OG)
+# All functions are prevalent
+# prot_fun_data <- prot_fun_data |> filter(function_name %in% prevalent_functions)
+saveRDS(prot_ogfun_data, file = "data/prot_ogfun_data.rds")
+prot_ogfun_data <- readRDS("data/prot_ogfun_data.rds")
+```
+
+```{r}
+# Define the function to fit the model and extract results
+fit_lmer <- function(x) {
+  tryCatch({
+    lmm <- lmer(NPX ~ value + group + week + (1 | patientid), data = x)
+    results <- summary(lmm)$coeff["value", c("Estimate", "Pr(>|t|)")]
+    return(results)
+  }, error = function(e) {
+    cat("Error in processing group:", unique(x$protein), "-", unique(x$function_name), "\n")
+    return(data.frame(Estimate = NA, `Pr(>|t|)` = NA))
+  })
+}
+
+# Set up parallel cluster
+num_cores <- detectCores() / 3  # Use a third of the number of cores
+cl <- makeCluster(num_cores)
+
+# Export necessary variables and packages to the cluster
+clusterExport(cl, varlist = c("fit_lmer", "prot_ogfun_data", "lmer", "summary", "cat"))
+clusterEvalQ(cl, library(lme4))
+
+# Split the data by unique combinations of protein and function_name
+split_data <- split(prot_ogfun_data, list(prot_ogfun_data$protein, prot_ogfun_data$OG), drop = TRUE)
+
+# Apply the function in parallel
+parallel_results <- parLapply(cl, split_data, fit_lmer)
+
+# Stop the cluster
+stopCluster(cl)
+
+# Combine the results
+lmer_results <- do.call(rbind, parallel_results)
+
+# Create the final data frame with the results
+lmer_results_df <- lmer_results  |>
+    rename(Estimate = Estimate, pvalue = Pr...t..) |> 
+    rownames_to_column(var = "Combined") |> 
+    separate(Combined, into = c("Protein", "OG"), sep = "\\.")
+
+# Adjust p-values and add significance levels
+lmer_results_df$pvalue_adj <- p.adjust(lmer_results_df$pvalue, method = "fdr")
+lmer_results_df$Significance <- ifelse(lmer_results_df$pvalue_adj < 0.001, "***",
+                                       ifelse(lmer_results_df$pvalue_adj < 0.01, "**",
+                                              ifelse(lmer_results_df$pvalue_adj < 0.1, "*", "")))
+protfunc_results <- lmer_results_df |> filter(pvalue_adj < 0.05) |> arrange(pvalue)
+# Output to file .xlsx
+# write.xlsx(protfunc_results, "results/prot_og_func_results_significant.xlsx", row.names = FALSE)
+```
+
+### Counts
+
+```{r}
+protfunc_results <- read_xlsx("results/prot_og_func_results_significant.xlsx")
+# Count the number of significant proteins per ko function
+og_counts <- protfunc_results |> 
+  group_by(Protein) |> 
+  summarize(
+    `Number of eggNOG orthologous groups (og)` = n_distinct(OG),
+    `eggNOG orthologous groups (og)` = paste(unique(OG), collapse = ", ")
+  ) |> 
+  arrange(desc(`Number of eggNOG orthologous groups (og)`))
+# Output to file .xlsx
+# write.xlsx(og_counts, "results/prot_og_func_counts_function.xlsx", row.names = FALSE)
+# # Count the number of significant ko functions per protein
+protein_counts <- protfunc_results |> 
+  group_by(OG) |> 
+  summarize(
+    `Number of proteins` = n_distinct(Protein),
+    `Proteins` = paste(unique(Protein), collapse = ", ")
+  ) |> 
+  arrange(desc(`Number of proteins`))
+# Merge with description of function from ogfuncdata
+protein_counts <- left_join(protein_counts, ogfuncdata |>
+                              select(OG, Description) |> distinct(),
+                            by = "OG") |> select(OG, Description,
+                                                 `Number of proteins`, Proteins)
+# Output to file .xlsx
+write.xlsx(protein_counts, "results/prot_og_func_counts_protein.xlsx", row.names = FALSE)
+```
+
+As there is a high number of significant correlations, we also filter by abs(Estimate) > 1 to prioritize correlations with relevant effect sizes.
+
+```{r}
+# Filter by abs(Estimate) > 1
+protfunc_results <- protfunc_results |> filter(abs(Estimate) > 1)
+# Output to file .xlsx
+# write.xlsx(protfunc_results, "results/prot_og_func_results_significant_highestimate.xlsx", row.names = FALSE)
+# Count the number of significant proteins per ko function
+og_counts <- protfunc_results |> 
+  group_by(Protein) |> 
+  summarize(
+    `Number of eggNOG orthologous groups (og)` = n_distinct(OG),
+    `eggNOG orthologous groups (og)` = paste(unique(OG), collapse = ", ")
+  ) |> 
+  arrange(desc(`Number of eggNOG orthologous groups (og)`))
+# Output to file .xlsx
+# write.xlsx(og_counts, "results/prot_og_func_counts_function_highestimate.xlsx", row.names = FALSE)
+# # Count the number of significant ko functions per protein
+protein_counts <- protfunc_results |> 
+  group_by(OG) |> 
+  summarize(
+    `Number of proteins` = n_distinct(Protein),
+    `Proteins` = paste(unique(Protein), collapse = ", ")
+  ) |> 
+  arrange(desc(`Number of proteins`))
+# Merge with description of function from ogfuncdata
+protein_counts <- left_join(protein_counts, ogfuncdata |>
+                              select(OG, Description) |> distinct(),
+                            by = "OG") |> select(OG, Description,
+                                                 `Number of proteins`, Proteins)
+# Output to file .xlsx
+write.xlsx(protein_counts, "results/prot_og_func_counts_protein_highestimate.xlsx", row.names = FALSE)
+```
+
+## KEGG orthologs (ko)
+
+```{r}
+## Keep values for weeks 0, 1, 8 and 24 only
+kofuncdata_long <- kofuncdata_long |> filter(week_cat %in% c(0, 1, 8, 24))
+## Keep only columns of interest
+kofuncdata_long <- kofuncdata_long |> select(sampleid, patientid, week, week_cat, group, KEGG_ko, value)
+# Join protein and functions data
+# Rebuild sampleid in protdata with week_cat
+protdata$sampleid_cat <- paste0("R_", protdata$patientid, "_W", sprintf("%02d", protdata$week_cat))
+# Filter by DEIPs
+# Proteins data
+dep_names <- GAMs_table |> filter(Significant == "Yes") |> rownames()
+protdata <- protdata |> filter(Assay %in% dep_names) |> select(patientid, week_cat, group, Assay, NPX, sampleid_cat)
+# Rebuild sampleid in kofuncdata_long with week_cat
+kofuncdata_long$sampleid_cat <- paste0("R_", kofuncdata_long$patientid, "_W", sprintf("%02d", kofuncdata_long$week_cat))
+## Check if there are samplids that are not in both dataframes
+kofuncdata_long_2del <- setdiff(unique(kofuncdata_long$sampleid_cat), unique(protdata$sampleid_cat))
+kofuncdata_long <- kofuncdata_long |> filter(!sampleid %in% kofuncdata_long_2del)
+kofuncdata_long_2del <- setdiff(unique(kofuncdata_long$sampleid_cat), unique(protdata$sampleid_cat)) # character(0)
+# Simplify
+kofuncdata_long <- kofuncdata_long |> select(sampleid_cat, patientid, week_cat, group, KEGG_ko, value)
+protdata <- protdata |> select(sampleid_cat, patientid, week_cat, group, Assay, NPX)
+# Join
+prot_kofun_data <- left_join(kofuncdata_long, protdata,
+                             by = c("sampleid_cat", "patientid", "week_cat", "group"),
+                             relationship = "many-to-many")
+colnames(prot_kofun_data) <- c("sampleid", "patientid", "week", "group", "KEGG_ko", "value", "protein", "NPX")
+# Count functions per group (filter by prevalence of functions):
+prevalent_functions <- prot_kofun_data  |> 
+  select(KEGG_ko, patientid, group) |> 
+  distinct() |> 
+  group_by(KEGG_ko) |> 
+  summarise(FMT_count = sum(group == "FMT"),
+            Placebo_count = sum(group == "Placebo")) |>
+  filter(FMT_count > 6 | Placebo_count > 6) |> 
+  pull(KEGG_ko)
+# All functions are prevalent
+# prot_fun_data <- prot_fun_data |> filter(function_name %in% prevalent_functions)
+saveRDS(prot_kofun_data, file = "data/prot_kofun_data.rds")
+prot_kofun_data <- readRDS("data/prot_kofun_data.rds")
+```
+
+```{r}
+# Define the function to fit the model and extract results
+fit_lmer <- function(x) {
+  tryCatch({
+    lmm <- lmer(NPX ~ value + group + week + (1 | patientid), data = x)
+    results <- summary(lmm)$coeff["value", c("Estimate", "Pr(>|t|)")]
+    return(results)
+  }, error = function(e) {
+    cat("Error in processing group:", unique(x$protein), "-", unique(x$function_name), "\n")
+    return(data.frame(Estimate = NA, `Pr(>|t|)` = NA))
+  })
+}
+
+# Set up parallel cluster
+num_cores <- detectCores() / 2  # Use half of the number of cores
+cl <- makeCluster(num_cores)
+
+# Export necessary variables and packages to the cluster
+clusterExport(cl, varlist = c("fit_lmer", "prot_kofun_data", "lmer", "summary", "cat"))
+clusterEvalQ(cl, library(lme4))
+
+# Split the data by unique combinations of protein and function_name
+split_data <- split(prot_kofun_data, list(prot_kofun_data$protein, prot_kofun_data$KEGG_ko), drop = TRUE)
+
+# Apply the function in parallel
+parallel_results <- parLapply(cl, split_data, fit_lmer)
+
+# Stop the cluster
+stopCluster(cl)
+
+# Combine the results
+lmer_results <- do.call(rbind, parallel_results)
+
+# Create the final data frame with the results
+lmer_results_df <- lmer_results  |>
+    rename(Estimate = Estimate, pvalue = Pr...t..) |> 
+    rownames_to_column(var = "Combined") |> 
+    separate(Combined, into = c("Protein", "KEGG_ko"), sep = "\\.")
+
+# Adjust p-values and add significance levels
+lmer_results_df$pvalue_adj <- p.adjust(lmer_results_df$pvalue, method = "fdr")
+lmer_results_df$Significance <- ifelse(lmer_results_df$pvalue_adj < 0.001, "***",
+                                       ifelse(lmer_results_df$pvalue_adj < 0.01, "**",
+                                              ifelse(lmer_results_df$pvalue_adj < 0.1, "*", "")))
+protfunc_results <- lmer_results_df |> filter(pvalue_adj < 0.05) |> arrange(pvalue)
+# Output to file .xlsx
+write.xlsx(protfunc_results, "results/prot_ko_func_results_significant.xlsx", row.names = FALSE)
+```
+
+```{r}
+protfunc_results <- read_xlsx("results/prot_ko_func_results_significant.xlsx")
+# Count the number of significant proteins per ko function
+ko_counts <- protfunc_results |> 
+  group_by(Protein) |> 
+  summarize(
+    `Number of KEGG orthologs (ko)` = n_distinct(KEGG_ko),
+    `KEGG orthologs (ko)` = paste(unique(KEGG_ko), collapse = ", ")
+  ) |> 
+  arrange(desc(`Number of KEGG orthologs (ko)`))
+# Output to file .xlsx
+# write.xlsx(og_counts, "results/prot_ko_func_counts_function.xlsx", row.names = FALSE)
+# # Count the number of significant ko functions per protein
+protein_counts <- protfunc_results |> 
+  group_by(KEGG_ko) |> 
+  summarize(
+    `Number of proteins` = n_distinct(Protein),
+    `Proteins` = paste(unique(Protein), collapse = ", ")
+  ) |> 
+  arrange(desc(`Number of proteins`))
+# Merge with description of function from kofuncdata
+protein_counts <- left_join(protein_counts, kofuncdata |>
+                              select(KEGG_ko, Description, Symbol) |> distinct(),
+                            by = "KEGG_ko") |> select(KEGG_ko, Description, Symbol,
+                                                 `Number of proteins`, Proteins)
+# Output to file .xlsx
+# write.xlsx(protein_counts, "results/prot_ko_func_counts_protein.xlsx", row.names = FALSE)
+```
+
+We also filter by abs(Estimate) > 1 to prioritize correlations with relevant effect sizes.
+
+```{r}
+# Filter by abs(Estimate) > 1
+protfunc_results <- protfunc_results |> filter(abs(Estimate) > 1)
+# Output to file .xlsx
+# write.xlsx(protfunc_results, "results/prot_ko_func_results_significant_highestimate.xlsx", row.names = FALSE)
+# Count the number of significant proteins per ko function
+ko_counts <- protfunc_results |> 
+  group_by(Protein) |> 
+  summarize(
+    `Number of KEGG orthologs (ko)` = n_distinct(KEGG_ko),
+    `KEGG orthologs (ko)` = paste(unique(KEGG_ko), collapse = ", ")
+  ) |> 
+  arrange(desc(`Number of KEGG orthologs (ko)`))
+# Output to file .xlsx
+# write.xlsx(og_counts, "results/prot_ko_func_counts_function_highestimate.xlsx", row.names = FALSE)
+# # Count the number of significant ko functions per protein
+protein_counts <- protfunc_results |> 
+  group_by(KEGG_ko) |> 
+  summarize(
+    `Number of proteins` = n_distinct(Protein),
+    `Proteins` = paste(unique(Protein), collapse = ", ")
+  ) |> 
+  arrange(desc(`Number of proteins`))
+# Merge with description of function from kofuncdata
+protein_counts <- left_join(protein_counts, kofuncdata |>
+                              select(KEGG_ko, Description, Symbol) |> distinct(),
+                            by = "KEGG_ko") |> select(KEGG_ko, Description, Symbol,
+                                                 `Number of proteins`, Proteins)
+# Output to file .xlsx
+write.xlsx(protein_counts, "results/prot_ko_func_counts_protein_highestimate.xlsx", row.names = FALSE)
+```
+
+## Novel gene families (nf)
+
+```{r}
+## Keep values for weeks 0, 1, 8 and 24 only
+nffuncdata_long <- nffuncdata_long |> filter(week_cat %in% c(0, 1, 8, 24))
+## Keep only columns of interest
+nffuncdata_long <- nffuncdata_long |> select(sampleid, patientid, week, week_cat, group, Novel_Fam, value)
+# Join protein and functions data
+# Rebuild sampleid in protdata with week_cat
+protdata$sampleid_cat <- paste0("R_", protdata$patientid, "_W", sprintf("%02d", protdata$week_cat))
+# Filter by DEIPs
+# Proteins data
+dep_names <- GAMs_table |> filter(Significant == "Yes") |> rownames()
+protdata <- protdata |> filter(Assay %in% dep_names) |> select(patientid, week_cat, group, Assay, NPX, sampleid_cat)
+# Rebuild sampleid in nffuncdata_long with week_cat
+nffuncdata_long$sampleid_cat <- paste0("R_", nffuncdata_long$patientid, "_W", sprintf("%02d", nffuncdata_long$week_cat))
+## Check if there are samplids that are not in both dataframes
+nffuncdata_long_2del <- setdiff(unique(nffuncdata_long$sampleid_cat), unique(protdata$sampleid_cat))
+nffuncdata_long <- nffuncdata_long |> filter(!sampleid %in% nffuncdata_long_2del)
+nffuncdata_long_2del <- setdiff(unique(nffuncdata_long$sampleid_cat), unique(protdata$sampleid_cat)) # character(0)
+# Simplify
+nffuncdata_long <- nffuncdata_long |> select(sampleid_cat, patientid, week_cat, group, Novel_Fam, value)
+protdata <- protdata |> select(sampleid_cat, patientid, week_cat, group, Assay, NPX)
+# Join
+prot_nffun_data <- left_join(nffuncdata_long, protdata,
+                             by = c("sampleid_cat", "patientid", "week_cat", "group"),
+                             relationship = "many-to-many")
+colnames(prot_nffun_data) <- c("sampleid", "patientid", "week", "group", "Novel_Fam", "value", "protein", "NPX")
+# Count functions per group (filter by prevalence of functions):
+prevalent_functions <- prot_nffun_data  |> 
+  select(Novel_Fam, patientid, group) |> 
+  distinct() |> 
+  group_by(Novel_Fam) |> 
+  summarise(FMT_count = sum(group == "FMT"),
+            Placebo_count = sum(group == "Placebo")) |>
+  filter(FMT_count > 6 | Placebo_count > 6) |> 
+  pull(Novel_Fam)
+# All functions are prevalent
+# prot_fun_data <- prot_fun_data |> filter(function_name %in% prevalent_functions)
+saveRDS(prot_nffun_data, file = "data/prot_nffun_data.rds")
+prot_nffun_data <- readRDS("data/prot_nffun_data.rds")
+```
+
+```{r}
+# Define the function to fit the model and extract results
+fit_lmer <- function(x) {
+  tryCatch({
+    lmm <- lmer(NPX ~ value + group + week + (1 | patientid), data = x)
+    results <- summary(lmm)$coeff["value", c("Estimate", "Pr(>|t|)")]
+    return(results)
+  }, error = function(e) {
+    cat("Error in processing group:", unique(x$protein), "-", unique(x$function_name), "\n")
+    return(data.frame(Estimate = NA, `Pr(>|t|)` = NA))
+  })
+}
+
+# Set up parallel cluster
+num_cores <- detectCores() / 2  # Use half of the number of cores
+cl <- makeCluster(num_cores)
+
+# Export necessary variables and packages to the cluster
+clusterExport(cl, varlist = c("fit_lmer", "prot_nffun_data", "lmer", "summary", "cat"))
+clusterEvalQ(cl, library(lme4))
+
+# Split the data by unique combinations of protein and function_name
+split_data <- split(prot_nffun_data, list(prot_nffun_data$protein, prot_nffun_data$Novel_Fam), drop = TRUE)
+
+# Apply the function in parallel
+parallel_results <- parLapply(cl, split_data, fit_lmer)
+
+
+# Stop the cluster
+stopCluster(cl)
+
+# Combine the results
+lmer_results <- do.call(rbind, parallel_results)
+
+# Create the final data frame with the results
+lmer_results_df <- lmer_results  |>
+    rename(Estimate = Estimate, pvalue = Pr...t..) |> 
+    rownames_to_column(var = "Combined") |> 
+    separate(Combined, into = c("Protein", "Novel_Fam"), sep = "\\.")
+
+# Adjust p-values and add significance levels
+lmer_results_df$pvalue_adj <- p.adjust(lmer_results_df$pvalue, method = "fdr")
+lmer_results_df$Significance <- ifelse(lmer_results_df$pvalue_adj < 0.001, "***",
+                                       ifelse(lmer_results_df$pvalue_adj < 0.01, "**",
+                                              ifelse(lmer_results_df$pvalue_adj < 0.1, "*", "")))
+protfunc_results <- lmer_results_df |> filter(pvalue_adj < 0.05) |> arrange(pvalue)
+# Output to file .xlsx
+write.xlsx(protfunc_results, "results/prot_nf_func_results_significant.xlsx", row.names = FALSE)
+```
+
+```{r}
+protfunc_results <- read_xlsx("results/prot_nf_func_results_significant.xlsx")
+# Count the number of significant proteins per nf function
+nf_counts <- protfunc_results |> 
+  group_by(Protein) |> 
+  summarize(
+    `Number of Novel gene families (nf)` = n_distinct(Novel_Fam),
+    `Novel gene families (nf)` = paste(unique(Novel_Fam), collapse = ", ")
+  ) |> 
+  arrange(desc(`Number of Novel gene families (nf)`))
+# Output to file .xlsx
+write.xlsx(og_counts, "results/prot_nf_func_counts_function.xlsx", row.names = FALSE)
+# # Count the number of significant ko functions per protein
+protein_counts <- protfunc_results |> 
+  group_by(Novel_Fam) |> 
+  summarize(
+    `Number of proteins` = n_distinct(Protein),
+    `Proteins` = paste(unique(Protein), collapse = ", ")
+  ) |> 
+  arrange(desc(`Number of proteins`))
+# Output to file .xlsx
+write.xlsx(protein_counts, "results/prot_nf_func_counts_protein.xlsx", row.names = FALSE)
+```
+
+We also filter by abs(Estimate) > 1 to prioritize correlations with relevant effect sizes.
+
+```{r}
+# Filter by abs(Estimate) > 1
+protfunc_results <- protfunc_results |> filter(abs(Estimate) > 1)
+# Output to file .xlsx
+write.xlsx(protfunc_results, "results/prot_nf_func_results_significant_highestimate.xlsx", row.names = FALSE)
+# Count the number of significant proteins per nf function
+nf_counts <- protfunc_results |> 
+  group_by(Protein) |> 
+  summarize(
+    `Number of Novel gene families (nf)` = n_distinct(Novel_Fam),
+    `Novel gene families (nf)` = paste(unique(Novel_Fam), collapse = ", ")
+  ) |> 
+  arrange(desc(`Number of Novel gene families (nf)`))
+# Output to file .xlsx
+# write.xlsx(og_counts, "results/prot_nf_func_counts_function_highestimate.xlsx", row.names = FALSE)
+# # Count the number of significant ko functions per protein
+protein_counts <- protfunc_results |> 
+  group_by(Novel_Fam) |> 
+  summarize(
+    `Number of proteins` = n_distinct(Protein),
+    `Proteins` = paste(unique(Protein), collapse = ", ")
+  ) |> 
+  arrange(desc(`Number of proteins`))
+# Output to file .xlsx
+# write.xlsx(protein_counts, "results/prot_nf_func_counts_protein_highestimate.xlsx", row.names = FALSE)
+```
+
+# Networks of interactions bacterial functions-plasma proteins
+
+```{r}
+protfunc_results <- read_xlsx("results/prot_ko_func_results_significant.xlsx")
+# Read correlation results data
+# protfunc_results                              # Get from previous code chunk
+protein_counts_filtered <- protein_counts |> 
+  filter(`Number of proteins` > 4)
+protfunc_results <- protfunc_results |> 
+    filter(KEGG_ko %in% protein_counts_filtered$KEGG_ko)
+# Format data for network plot
+network_data <- protfunc_results |>
+    mutate(from = KEGG_ko, to = Protein, weight = abs(Estimate)) |> 
+    select(from, to, weight)
+network_plot <- graph_from_data_frame(network_data, directed = FALSE)
+# First plot
+ggraph(network_plot, layout = "fr") +
+    geom_edge_link(aes(edge_alpha = weight), show.legend = FALSE) +
+    geom_node_point(color = "lightblue", size = 5) +
+    geom_node_text(aes(label = name), repel = TRUE) +
+    theme_void()
+# Assign shapes based on whether the node is a bacteria or a protein
+V(network_plot)$shape <- ifelse(V(network_plot)$name %in% protfunc_results$KEGG_ko, "KEGG_ko", "protein")
+# Calculate the degree (number of connections) for each node
+V(network_plot)$degree <- degree(network_plot, mode = "all")
+# Normalize node sizes for better visualization (optional)
+V(network_plot)$size <- V(network_plot)$degree / max(V(network_plot)$degree) * 10 + 3  # Scaling factor
+# Plot network
+svg("figs/Figure_6B_network_KEGG_ko&DEIPs_filtered.svg", width = 10, height = 10)
+ggraph(network_plot, layout = "fr") +
+    geom_edge_link(aes(edge_alpha = weight)) +
+    geom_node_point(aes(shape = shape, size = size), fill = "lightblue") +
+    geom_node_text(aes(label = name), repel = TRUE) +
+    scale_shape_manual(values = c("KEGG_ko" = 21, "protein" = 22)) +
+    theme_void()
+dev.off()
+```
+
