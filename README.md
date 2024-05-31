@@ -1,6 +1,7 @@
 # Fecal Microbiota Transplantation Alters the Proteomic Landscape of Inflammation in HIV: Identifying Bacterial Drivers
-### Claudio Díaz-García*, Elena Moreno*, Alba Talavera, Lucía Martín-Fernández, Laura Martín-Pedraza, José A. Pérez-Molina, Sara González-Bodí, Jaime Huerta-Cepas, Fernando Dronda, María José Gosalbes, Laura Luna, María Jesús Vivancos, Santiago Moreno§, Sergio Serrano-Villar§
+### Claudio Díaz-García*, Elena Moreno*, Alba Talavera, Lucía Martín-Fernández, Laura Martín-Pedraza, José A. Pérez-Molina, Sara González-Bodí, Jaime Huerta-Cepas, Fernando Dronda, María José Gosalbes, Laura Luna, María Jesús Vivancos, Santiago Moreno<sup>§</sup>, Sergio Serrano-Villar<sup>§</sup>
 *Co-first authors 
+
 §Co-senior authors 
 
 ### Abstract
